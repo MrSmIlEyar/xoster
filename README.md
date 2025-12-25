@@ -1,0 +1,2 @@
+# xoster
+mirroring tg channels
