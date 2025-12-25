@@ -1,0 +1,4 @@
+dotenv~=0.9.9
+python-dotenv~=1.2.1
+httpx~=0.28.1
+Telethon~=1.42.0
