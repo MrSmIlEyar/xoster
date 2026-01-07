@@ -21,13 +21,12 @@ UserBot для автопостинга и зеркалирования Telegram
 - API_ID, API_HASH: [TelegramApps](https://my.telegram.org/apps) 
 - DEEPSEEK_API_KEY: [DeepSeek API]( https://platform.deepseek.com)
 
-- BOT_TOKEN: [BotFather](https://t.me/BotFather) - создать бота, сделать его админом своего канала
 - SOURCE_CHANNELS: придерживаясь формату шаблона вписать алиасы сетки каналов для зеркалирования (подписаться на них)
 - TARGET_CHANNEL: вписать алиас своего канала
 
 3. Запуск скрипта
 - ```python -m venv .venv```
-- ```python install -r requirements.txt```
+- ```pip install -r requirements.txt```
 - ```python main.py```
 
 Возможны неточности в обработке рекламных постов!
