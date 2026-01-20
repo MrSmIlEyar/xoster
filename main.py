@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
-from telethon.tl.types import MessageEntityCustomEmoji, MessageEntityTextUrl
+from telethon import TelegramClient, events, functions
+from telethon.tl.types import MessageEntityCustomEmoji, MessageEntityTextUrl, MessageMediaDocument
 import httpx
 
 load_dotenv()
@@ -17,7 +17,7 @@ API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE")
 
 SOURCE_CHANNELS = [ch.strip() for ch in os.getenv("SOURCE_CHANNELS", "").split(",") if ch.strip()]
-TARGET_CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID", "0"))  # private: -100...
+TARGET_CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID", "0"))
 
 WORKDIR = Path(os.getenv("WORKDIR", "./_mirror_tmp"))
 MAP_FILE = Path(os.getenv("MAP_FILE", "./mirror_map.json"))
@@ -32,7 +32,7 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
 # dedup
-TRIGRAM_THRESHOLD = float(os.getenv("TRIGRAM_THRESHOLD", "0.17"))
+TRIGRAM_THRESHOLD = float(os.getenv("TRIGRAM_THRESHOLD", "0.15"))
 DEDUP_HISTORY_SIZE = int(os.getenv("DEDUP_HISTORY_SIZE", "100"))
 
 # premium emoji
@@ -181,7 +181,8 @@ async def is_advertisement(text: str) -> bool:
                     "messages": [
                         {
                             "role": "system",
-                            "content": """Ты анализируешь тексты и определяешь, является ли текст рекламой или новостью.
+                            "content": """
+Ты анализируешь тексты и определяешь, является ли текст рекламой или новостью.
 
 Реклама - это:
 - Предложение услуг/товаров (купи, закажи, скачай, используй)
@@ -220,6 +221,7 @@ async def is_advertisement(text: str) -> bool:
             return is_ad
 
     except Exception as e:
+        print(e)
         print(f"⚠ Ошибка при обращении к API для проверки рекламы: {e}")
         return False
 
@@ -241,13 +243,14 @@ async def rewrite_text_with_ai(text: str) -> Optional[str]:
                             "content": """Ты пишешь посты для Telegram канала новостей.
 Правила:
 - Переформулируй новость кратко и энергично
-- МАКСИМУМ 350 символов
+- МАКСИМУМ 500 символов
 - БЕЗ лишних деталей и воды
-- БЕЗ "Как сообщает", "По словам", и т.п.
+- Удаляя приписки названий каналов внизу поста
 - Только суть и факты
-- Эмодзи добавлять не нужно
+- Эмодзи добавлять не нужно, а если есть эмодзи в исходном посте, то удаляешь его
 - Сейчас 2026 год
-- Отвечай ТОЛЬКО текстом поста, ничего больше""",
+- Отвечай ТОЛЬКО переформулированным текстом поста, ничего больше
+- Если в тексте встречается запрещённое на территории РФ термин, то в конце новости добавь, что это запрещено на территории РФ""",
                         },
                         {"role": "user", "content": f"Переписать в стиль Telegram поста:\n\n{text}"},
                     ],
@@ -297,16 +300,30 @@ async def reupload_single(msg, source_channel: str):
         file_path = await client.download_media(msg, file=str(WORKDIR))
         if not file_path:
             message_text, entities = safe_text_for_message(text)
-            return await client.send_message(TARGET_CHANNEL_ID, message_text, formatting_entities=entities, link_preview=False)
+            return await client.send_message(
+                TARGET_CHANNEL_ID,
+                message_text,
+                formatting_entities=entities,
+                link_preview=False
+            )
 
         caption_text, caption_entities = safe_caption_for_media(text)
+
+        send_kwargs = dict(
+            caption=caption_text,
+            force_document=False,
+            formatting_entities=caption_entities,
+        )
+
+        if isinstance(msg.media, MessageMediaDocument) and msg.media.document:
+            send_kwargs["attributes"] = msg.media.document.attributes
+
+            send_kwargs["supports_streaming"] = True
+
         sent = await client.send_file(
             TARGET_CHANNEL_ID,
             file_path,
-            caption=caption_text,
-            supports_streaming=bool(msg.video),
-            force_document=False,
-            formatting_entities=caption_entities,
+            **send_kwargs
         )
 
         if sent:
@@ -319,21 +336,19 @@ async def reupload_single(msg, source_channel: str):
 
 async def edit_single(target_msg_id: int, new_text: str, is_caption: bool = False):
     if is_caption:
-        caption_text, caption_entities = safe_caption_for_media(new_text)
-        await client.edit_message(
-            TARGET_CHANNEL_ID,
-            target_msg_id,
-            caption_text,
-            formatting_entities=caption_entities,
-        )
+        final_text, final_entities = safe_caption_for_media(new_text)
     else:
-        message_text, entities = safe_text_for_message(new_text)
-        await client.edit_message(
-            TARGET_CHANNEL_ID,
-            target_msg_id,
-            message_text,
-            formatting_entities=entities,
+        final_text, final_entities = safe_text_for_message(new_text)
+
+    await client(
+        functions.messages.EditMessageRequest(
+            peer=TARGET_PEER,
+            id=int(target_msg_id),
+            message=final_text,
+            entities=final_entities,
+            no_webpage=True
         )
+    )
 
 
 def register_handlers_for_source(source_channel: str):
@@ -468,6 +483,8 @@ async def main():
     for ch in SOURCE_CHANNELS:
         try:
             await client.get_entity(ch)
+            global TARGET_PEER
+            TARGET_PEER = await client.get_input_entity(TARGET_CHANNEL_ID)
         except Exception:
             pass
 
