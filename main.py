@@ -1,12 +1,19 @@
 import os
 import re
 import json
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, functions
-from telethon.tl.types import MessageEntityCustomEmoji, MessageEntityTextUrl, MessageMediaDocument
+from telethon.tl.types import (
+    MessageEntityCustomEmoji,
+    MessageEntityTextUrl,
+    MessageMediaDocument,
+    DocumentAttributeVideo,
+)
 import httpx
 
 load_dotenv()
@@ -47,6 +54,8 @@ if not DEEPSEEK_API_KEY:
 WORKDIR.mkdir(parents=True, exist_ok=True)
 client = TelegramClient("mirror_reupload", API_ID, API_HASH)
 
+TARGET_PEER = None  # выставим в main()
+
 
 def footer_text_and_entities(base_offset: int) -> tuple[str, list]:
     """
@@ -85,20 +94,8 @@ def safe_text_for_message(text: str | None) -> tuple[str, list]:
 
 
 def safe_caption_for_media(text: str | None) -> tuple[str, list]:
-    text = text or ""
-    safe_text = re.sub(r'@[\w_]+', "", text).strip()
-
-    base = f"⚡ {safe_text}" if safe_text else "⚡"
-    entities = [MessageEntityCustomEmoji(offset=0, length=1, document_id=PREMIUM_EMOJI_ID)]
-
-    if TARGET_TITLE and TARGET_LINK:
-        base_with_sep = base + "\n\n"
-        ft, fent = footer_text_and_entities(base_offset=len(base_with_sep))
-        result_text = base_with_sep + ft
-        entities.extend(fent)
-        return result_text, entities
-
-    return base, entities
+    # сейчас одинаково с safe_text_for_message, оставляю отдельной функцией под будущее
+    return safe_text_for_message(text)
 
 
 def get_trigrams(text: str) -> set:
@@ -167,6 +164,59 @@ def cleanup_workdir() -> None:
         print(f"⚠️ Ошибка при очистке директории {WORKDIR}: {e}")
 
 
+def has_ffmpeg() -> bool:
+    return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+
+
+def ffprobe_meta(path: str) -> tuple[int, int, int]:
+    """
+    duration(sec), width, height
+    Если ffprobe не доступен или что-то пошло не так — вернём нули (Telegram переживёт).
+    """
+    if not shutil.which("ffprobe"):
+        return 0, 0, 0
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height:format=duration",
+            "-of", "json",
+            path
+        ]
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        data = json.loads(p.stdout or "{}")
+        streams = data.get("streams") or [{}]
+        fmt = data.get("format") or {}
+        w = int(streams[0].get("width") or 0)
+        h = int(streams[0].get("height") or 0)
+        dur = int(float(fmt.get("duration") or 0))
+        return dur, w, h
+    except Exception:
+        return 0, 0, 0
+
+
+def make_thumb(video_path: str, out_jpg: Path) -> Optional[Path]:
+    """
+    Делаем JPEG-превью (1 кадр).
+    Важно: в альбомах Telethon может игнорировать thumb, поэтому для видео в альбомах мы шлём по одному.
+    """
+    if not shutil.which("ffmpeg"):
+        return None
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", "1",
+            "-i", video_path,
+            "-frames:v", "1",
+            "-vf", "scale=320:-1",
+            str(out_jpg)
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return out_jpg if out_jpg.exists() else None
+    except Exception:
+        return None
+
+
 async def is_advertisement(text: str) -> bool:
     if not text or len(text.strip()) < 20:
         return False
@@ -221,7 +271,6 @@ async def is_advertisement(text: str) -> bool:
             return is_ad
 
     except Exception as e:
-        print(e)
         print(f"⚠ Ошибка при обращении к API для проверки рекламы: {e}")
         return False
 
@@ -279,6 +328,40 @@ if "dedup_history" not in state:
     save_map(state)
 
 
+async def send_media_file(
+    file_path: str,
+    caption_text: str,
+    caption_entities: list,
+    is_video: bool,
+):
+    """
+    Единая отправка файла (single). Для видео добавляем attrs + thumb.
+    supports_streaming должен быть и параметром send_file, и флагом в DocumentAttributeVideo. [web:20]
+    """
+    send_kwargs = dict(
+        caption=caption_text,
+        force_document=False,
+        formatting_entities=caption_entities,
+        supports_streaming=bool(is_video),
+    )
+
+    if is_video:
+        dur, w, h = ffprobe_meta(file_path)
+        send_kwargs["attributes"] = [DocumentAttributeVideo(
+            duration=dur,
+            w=w,
+            h=h,
+            supports_streaming=True
+        )]  # ключевой момент для streamable видео [web:20]
+
+        if has_ffmpeg():
+            thumb_path = make_thumb(file_path, WORKDIR / f"thumb_{Path(file_path).stem}.jpg")
+            if thumb_path:
+                send_kwargs["thumb"] = str(thumb_path)
+
+    return await client.send_file(TARGET_CHANNEL_ID, file_path, **send_kwargs)
+
+
 async def reupload_single(msg, source_channel: str):
     text = msg.message or ""
 
@@ -309,21 +392,11 @@ async def reupload_single(msg, source_channel: str):
 
         caption_text, caption_entities = safe_caption_for_media(text)
 
-        send_kwargs = dict(
-            caption=caption_text,
-            force_document=False,
-            formatting_entities=caption_entities,
-        )
-
-        if isinstance(msg.media, MessageMediaDocument) and msg.media.document:
-            send_kwargs["attributes"] = msg.media.document.attributes
-
-            send_kwargs["supports_streaming"] = True
-
-        sent = await client.send_file(
-            TARGET_CHANNEL_ID,
-            file_path,
-            **send_kwargs
+        sent = await send_media_file(
+            file_path=file_path,
+            caption_text=caption_text,
+            caption_entities=caption_entities,
+            is_video=bool(msg.video),
         )
 
         if sent:
@@ -340,14 +413,13 @@ async def edit_single(target_msg_id: int, new_text: str, is_caption: bool = Fals
     else:
         final_text, final_entities = safe_text_for_message(new_text)
 
-    await client(
-        functions.messages.EditMessageRequest(
-            peer=TARGET_PEER,
-            id=int(target_msg_id),
-            message=final_text,
-            entities=final_entities,
-            no_webpage=True
-        )
+    # Тут важно отключать превью при редактировании (link_preview=False -> no_webpage=True)
+    await client.edit_message(
+        entity=TARGET_PEER,
+        message=int(target_msg_id),
+        text=final_text,
+        formatting_entities=final_entities,
+        link_preview=False,
     )
 
 
@@ -432,32 +504,62 @@ def register_handlers_for_source(source_channel: str):
 
         print(f"📷 Новый альбом #{grouped_id} из {source_channel}")
 
-        files = []
-        any_video = False
-        for m in msgs:
-            if not m.media:
-                continue
+        # скачиваем файлы
+        media_msgs = [m for m in msgs if m.media]
+        files: list[str] = []
+        for m in media_msgs:
             fp = await client.download_media(m, file=str(WORKDIR))
             if fp:
                 files.append(fp)
-            if m.video:
-                any_video = True
 
         caption_text, caption_entities = safe_caption_for_media(caption_src)
 
         if not files:
-            sent = await client.send_message(TARGET_CHANNEL_ID, caption_text, formatting_entities=caption_entities, link_preview=False)
+            sent = await client.send_message(
+                TARGET_CHANNEL_ID,
+                caption_text,
+                formatting_entities=caption_entities,
+                link_preview=False
+            )
             state["album"][album_key] = {"target_msg_ids": [sent.id], "caption_msg_id": sent.id}
             save_map(state)
             return
 
+        # Важный фикс: если в альбоме есть видео — отправляем по одному,
+        # потому что с thumb/атрибутами в альбомах у Telethon бывают проблемы. [web:17]
+        if any(m.video for m in media_msgs):
+            print("🎬 В альбоме есть видео -> отправляем по одному (fix preview/streaming)")
+            target_ids: list[int] = []
+            caption_msg_id = None
+
+            for idx, (m, fp) in enumerate(zip(media_msgs, files)):
+                sent = await send_media_file(
+                    file_path=fp,
+                    caption_text=caption_text if idx == 0 else "",
+                    caption_entities=caption_entities if idx == 0 else [],
+                    is_video=bool(m.video),
+                )
+                if sent:
+                    target_ids.append(sent.id)
+                    if caption_msg_id is None:
+                        caption_msg_id = sent.id
+
+                cleanup_media(fp)
+
+            state["album"][album_key] = {"target_msg_ids": target_ids, "caption_msg_id": caption_msg_id}
+            save_map(state)
+            cleanup_workdir()
+            print(f"✅ Альбом отправлен по одному ({len(target_ids)} сообщений)")
+            return
+
+        # Если видео нет — можно слать настоящим альбомом (быстрее)
         sent_messages = await client.send_file(
             TARGET_CHANNEL_ID,
             files,
             caption=caption_text,
-            supports_streaming=any_video,
             force_document=False,
             formatting_entities=caption_entities,
+            supports_streaming=False,
         )
 
         sent_list = sent_messages if isinstance(sent_messages, list) else [sent_messages]
@@ -480,24 +582,27 @@ for ch in SOURCE_CHANNELS:
 async def main():
     await client.start(phone=PHONE)
 
+    global TARGET_PEER
+    TARGET_PEER = await client.get_input_entity(TARGET_CHANNEL_ID)
+
+    # проверим источники (не обязательно, но удобно)
     for ch in SOURCE_CHANNELS:
         try:
             await client.get_entity(ch)
-            global TARGET_PEER
-            TARGET_PEER = await client.get_input_entity(TARGET_CHANNEL_ID)
         except Exception:
             pass
 
     await client.get_entity(TARGET_CHANNEL_ID)
 
-    print("\n🚀 Mirror started (PRIVATE TARGET + clickable TITLE footer + dedup + AI + AD FILTER)")
+    print("\n🚀 Mirror started (PRIVATE TARGET + clickable TITLE footer + dedup + AI + AD FILTER + VIDEO FIX)")
     print(f"   Sources: {', '.join(SOURCE_CHANNELS)}")
     print(f"   Target (private id): {TARGET_CHANNEL_ID}")
     print(f"   Footer title: {TARGET_TITLE or '-'}")
     print(f"   Footer link: {TARGET_LINK or '-'}")
     print(f"   Dedup threshold: {TRIGRAM_THRESHOLD:.0%}")
     print(f"   AI Model: {DEEPSEEK_MODEL}")
-    print(f"   Premium emoji ID: {PREMIUM_EMOJI_ID}\n")
+    print(f"   Premium emoji ID: {PREMIUM_EMOJI_ID}")
+    print(f"   ffmpeg available: {'yes' if has_ffmpeg() else 'no'}\n")
 
     await client.run_until_disconnected()
 
