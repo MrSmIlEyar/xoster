@@ -85,7 +85,7 @@ def safe_text_for_message(text: str | None) -> tuple[str, list]:
     # Если после удаления упоминаний осталась пустая строка
     # или только спецсимволы, используем заглушку
     if not safe_text or len(safe_text.strip()) == 0:
-        safe_text = "Новость"
+        safe_text = ""
 
     # Удаляем возможные множественные пробелы
     safe_text = re.sub(r'\s+', ' ', safe_text).strip()
@@ -498,7 +498,7 @@ def register_handlers_for_source(source_channel: str):
         # Гарантируем, что текст не пустой после обработки
         if not caption_src or len(caption_src.strip()) == 0:
             print(f"⚠️ Предупреждение: текст альбома пустой после обработки, используем заглушку")
-            caption_src = "Новость"
+            return
 
         album_key = f"{source_channel}:{grouped_id}"
         if album_key in state["album"]:
